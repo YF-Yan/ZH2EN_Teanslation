@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>矩阵分块 Tensor 3D 可视化</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111111; color: white; font-family: 'Segoe UI', system-ui, sans-serif; }
+        #info { position: absolute; top: 15px; width: 100%; text-align: center; pointer-events: none; z-index: 10; }
+        h3 { margin: 0 0 8px 0; font-size: 22px; letter-spacing: 1px; color: #ffffff; text-shadow: 0 2px 4px rgba(0,0,0,0.6); }
+        p { margin: 0; color: #bbbbbb; font-size: 13px; }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+        .axis-legend { position: absolute; bottom: 20px; left: 20px; font-family: system-ui, sans-serif; font-size: 12px; background: rgba(0,0,0,0.75); padding: 12px; border-radius: 6px; border: 1px solid #333; line-height: 1.6; }
+        .axis-line { display: inline-block; width: 12px; height: 12px; margin-right: 5px; vertical-align: middle; border-radius: 2px; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h3>张量三维变换可视化 (矩阵分块定制版)</h3>
+        <p>🖱️ 鼠标左键拖拽：旋转视角观摩分块 | 📜 鼠标滚轮：缩放画面</p>
+    </div>
+
+    <div class="axis-legend">
+        <strong>你的立体坐标系映射：</strong><br>
+        <span class="axis-line" style="background:#ff4444"></span>🔴 X 轴 (前后纵深)：Batch Size (数据个数)<br>
+        <span class="axis-line" style="background:#44ff44"></span>🟢 Y 轴 (左右水平)：Tokens (序列长度)<br>
+        <span class="axis-line" style="background:#4444ff"></span>🔵 Z 轴 (上下垂直)：Feature Dim (特征维度)
+    </div>
+
+    <canvas id="canvas-container"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas-container');
+        const ctx = canvas.getContext('2d');
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // 3D 视角参数 (微调初始角度以获得极佳的网格立体感)
+        let angleX = -0.35;
+        let angleY = -0.65;
+        let cameraZoom = 1.35;
+        const distance = 60;
+
+        let vertices = [];
+        let faces = [];
+        let labels = [];
+
+        // 创建单个矩阵分块晶格 (Voxel)
+        // ux, uy, uz 代表符合用户直觉的 X(前后), Y(左右), Z(上下)
+        function createVoxel(ux, uy, uz, size, color) {
+            const r = size / 2;
+            const x0 = ux - r, x1 = ux + r;
+            const y0 = uy - r, y1 = uy + r;
+            const z0 = uz - r, uz1 = uz + r;
+
+            const startIdx = vertices.length;
+
+            // 核心映射转换：
+            // 用户定义的 X(前后) -> 映射到世界坐标系的 Z 轴 (深度)
+            // 用户定义的 Y(左右) -> 映射到世界坐标系的 X 轴 (水平)
+            // 用户定义的 Z(上下) -> 映射到世界坐标系的 Y 轴 (垂直)
+            const localVertices = [
+                {x: x0, y: y0, z: z0}, {x: x1, y: y0, z: z0},
+                {x: x1, y: y1, z: z0}, {x: x0, y: y1, z: z0},
+                {x: x0, y: y0, z: uz1}, {x: x1, y: y0, z: uz1},
+                {x: x1, y: y1, z: uz1}, {x: x0, y: y1, z: uz1}
+            ];
+
+            localVertices.forEach(v => {
+                vertices.push({
+                    x: v.y, // 世界 X = 用户 Y (左右)
+                    y: v.z, // 世界 Y = 用户 Z (上下)
+                    z: v.x  // 世界 Z = 用户 X (前后)
+                });
+            });
+
+            const localFaces = [
+                [0, 1, 2, 3], [4, 5, 6, 7],
+                [0, 1, 5, 4], [2, 3, 7, 6],
+                [0, 3, 7, 4], [1, 2, 6, 5]
+            ];
+
+            localFaces.forEach(indices => {
+                faces.push({
+                    indices: indices.map(i => startIdx + i),
+                    color: color,
+                    isAxis: false
+                });
+            });
+        }
+
+        // 添加 3D 辅助坐标轴小箭头
+        function createAxisLine(ax, ay, az, bx, by, bz, color, name) {
+            const startIdx = vertices.length;
+            vertices.push({ x: ay, y: az, z: ax }); // 起点
+            vertices.push({ x: by, y: bz, z: bx }); // 终点
+            faces.push({
+                indices: [startIdx, startIdx + 1],
+                color: color,
+                isAxis: true,
+                name: name
+            });
+        }
+
+        // --- 构建分块矩阵数据流水线 ---
+        // 设定矩阵规格：Batch(X)=3, Tokens(Y)=4, EmbedDim/Hidden(Z)
+        const B = 3;  // X轴深度
+        const L = 4;  // Y轴宽度
+        const E = 4;  // Z轴高度 (Embedding 维度)
+        const H = 3;  // Z轴高度 (Hidden 维度)
+
+        const voxelSize = 0.75; // 晶格大小
+        const step = 1.0;       // 间距步长 (留下 0.25 的缝隙展现分块感)
+        const stageSpacing = 16; // 阶段间距
+
+        // 阶段 1: Input x [B, L] -> 只有前后(X)和左右(Y)，上下(Z)厚度只有1层
+        const offsetY1 = -stageSpacing * 1.5;
+        for(let b=0; b<B; b++) {
+            for(let l=0; l<L; l++) {
+                let ux = (b - (B-1)/2) * step;
+                let uy = (l - (L-1)/2) * step + offsetY1;
+                let uz = 0;
+                createVoxel(ux, uy, uz, voxelSize, 'rgba(33, 150, 243');
+            }
+        }
+        labels.push({ x: offsetY1, y: -4, z: 0, name: '1. Input (x)', shape: `[${B}, ${L}]` });
+
+        // 阶段 2: Embedded [B, L, E] -> 矩阵在垂直(Z)方向长高，变为完整的 3D 晶格群
+        const offsetY2 = -stageSpacing * 0.5;
+        for(let b=0; b<B; b++) {
+            for(let l=0; l<L; l++) {
+                for(let e=0; e<E; e++) {
+                    let ux = (b - (B-1)/2) * step;
+                    let uy = (l - (L-1)/2) * step + offsetY2;
+                    let uz = (e - (E-1)/2) * step;
+                    createVoxel(ux, uy, uz, voxelSize, 'rgba(76, 175, 80');
+                }
+            }
+        }
+        labels.push({ x: offsetY2, y: -4, z: 0, name: '2. Embedded', shape: `[${B}, ${L}, ${E}]` });
+
+        // 阶段 3: GRU Output [B, L, H] -> 矩阵在垂直(Z)方向高度缩减为 Hidden Size
+        const offsetY3 = stageSpacing * 0.5;
+        for(let b=0; b<B; b++) {
+            for(let l=0; l<L; l++) {
+                for(let h=0; h<H; h++) {
+                    let ux = (b - (B-1)/2) * step;
+                    let uy = (l - (L-1)/2) * step + offsetY3;
+                    let uz = (h - (H-1)/2) * step;
+                    createVoxel(ux, uy, uz, voxelSize, 'rgba(255, 152, 0');
+                }
+            }
+        }
+        labels.push({ x: offsetY3, y: -4, z: 0, name: '3. GRU Output', shape: `[${B}, ${L}, ${H}]` });
+
+        // 阶段 4: Last Hidden State [B, H] -> 代码执行切片，只取最后一个有效 Token
+        // 视觉表现：左右方向(Y)只留下最后一列分块，前后(X)和上下(Z)保留
+        const offsetY4 = stageSpacing * 1.5;
+        for(let b=0; b<B; b++) {
+            for(let h=0; h<H; h++) {
+                let ux = (b - (B-1)/2) * step;
+                // 故意将其对齐到局部 Y 轴的末端，还原从序列末尾“切片”抠出数据的动态感
+                let uy = ((L-1)/2) * step + offsetY4;
+                let uz = (h - (H-1)/2) * step;
+                createVoxel(ux, uy, uz, voxelSize, 'rgba(244, 67, 54');
+            }
+        }
+        labels.push({ x: offsetY4, y: -4, z: 0, name: '4. Last Hidden', shape: `[${B}, ${H}]` });
+
+        // 在场景左侧绘制一个全景 3D 坐标轴指示器
+        const ax0 = -2, ay0 = -32, az0 = -4;
+        createAxisLine(ax0, ay0, az0, ax0 + 4, ay0, az0, '#ff4444', 'X (Batch)');
+        createAxisLine(ax0, ay0, az0, ax0, ay0 + 4, az0, '#44ff44', 'Y (Token)');
+        createAxisLine(ax0, ay0, az0, ax0, ay0, az0 + 4, '#4444ff', 'Z (Dim)');
+
+
+        // --- 3D 渲染核心算法 ---
+        function render() {
+            ctx.fillStyle = '#111111';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // 投影计算
+            let transformed = vertices.map(v => {
+                // 绕 Y 轴旋转
+                let x1 = v.x * Math.cos(angleY) - v.z * Math.sin(angleY);
+                let z1 = v.x * Math.sin(angleY) + v.z * Math.cos(angleY);
+                // 绕 X 轴旋转
+                let y2 = v.y * Math.cos(angleX) - z1 * Math.sin(angleX);
+                let z2 = v.y * Math.sin(angleX) + z1 * Math.cos(angleX);
+
+                const scale = (cameraZoom * width * 0.04) / (1 + z2 / distance);
+                return {
+                    x: width / 2 + x1 * scale,
+                    y: height / 2 - y2 * scale,
+                    z: z2
+                };
+            });
+
+            // 为渲染面和线计算深度排序（画家算法阻绝透视穿帮）
+            faces.forEach(f => {
+                if (f.isAxis) {
+                    f.avgZ = (transformed[f.indices[0]].z + transformed[f.indices[1]].z) / 2;
+                } else {
+                    f.avgZ = f.indices.reduce((sum, idx) => sum + transformed[idx].z, 0) / 4;
+                }
+            });
+            faces.sort((a, b) => b.avgZ - a.avgZ);
+
+            // 绘制
+            faces.forEach(f => {
+                if (f.isAxis) {
+                    // 绘制坐标轴指示线
+                    ctx.beginPath();
+                    ctx.moveTo(transformed[f.indices[0]].x, transformed[f.indices[0]].y);
+                    ctx.lineTo(transformed[f.indices[1]].x, transformed[f.indices[1]].y);
+                    ctx.strokeStyle = f.color;
+                    ctx.lineWidth = 3;
+                    ctx.stroke();
+
+                    // 附带轴向文字
+                    ctx.fillStyle = f.color;
+                    ctx.font = '10px monospace';
+                    ctx.fillText(f.name, transformed[f.indices[1]].x + 5, transformed[f.indices[1]].y);
+                } else {
+                    // 绘制矩阵微晶格面
+                    ctx.beginPath();
+                    ctx.moveTo(transformed[f.indices[0]].x, transformed[f.indices[0]].y);
+                    for(let i = 1; i < 4; i++) {
+                        ctx.lineTo(transformed[f.indices[i]].x, transformed[f.indices[i]].y);
+                    }
+                    ctx.closePath();
+
+                    ctx.fillStyle = f.color + ', 0.45)';
+                    ctx.fill();
+
+                    // 高亮矩阵晶格线条，形成明显的“分块网格”视觉
+                    ctx.strokeStyle = f.color + ', 1)';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+            });
+
+            // 渲染四个阶段的悬浮文本浮标
+            labels.forEach(label => {
+                // 将标签的 3D 空间坐标投影到屏幕
+                let x1 = label.x * Math.cos(angleY) - label.z * Math.sin(angleY);
+                let z1 = label.x * Math.sin(angleY) + label.z * Math.cos(angleY);
+                let y2 = label.y * Math.cos(angleX) - z1 * Math.sin(angleX);
+                let z2 = label.y * Math.sin(angleX) + z1 * Math.cos(angleX);
+                const scale = (cameraZoom * width * 0.04) / (1 + z2 / distance);
+                const scrX = width / 2 + x1 * scale;
+                const scrY = height / 2 - y2 * scale;
+
+                // 绘制面板
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.strokeStyle = '#444';
+                ctx.lineWidth = 1;
+
+                const t1 = label.name;
+                const t2 = label.shape;
+                ctx.font = 'bold 12px sans-serif';
+                const w1 = ctx.measureText(t1).width;
+                ctx.font = '11px monospace';
+                const w2 = ctx.measureText(t2).width;
+                const bW = Math.max(w1, w2) + 16;
+                const bH = 38;
+
+                ctx.fillRect(scrX - bW/2, scrY, bW, bH);
+                ctx.strokeRect(scrX - bW/2, scrY, bW, bH);
+
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold 12px sans-serif';
+                ctx.fillText(t1, scrX, scrY + 5);
+
+                ctx.fillStyle = '#00ffcc';
+                ctx.font = '11px monospace';
+                ctx.fillText(t2, scrX, scrY + 20);
+            });
+        }
+
+        // 鼠标控制核心
+        let isDragging = false;
+        let prevMouseX = 0;
+        let prevMouseY = 0;
+
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            prevMouseX = e.clientX;
+            prevMouseY = e.clientY;
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const deltaX = e.clientX - prevMouseX;
+            const deltaY = e.clientY - prevMouseY;
+
+            angleY += deltaX * 0.007;
+            angleX += deltaY * 0.007;
+            angleX = Math.max(-Math.PI/2, Math.min(Math.PI/2, angleX));
+
+            prevMouseX = e.clientX;
+            prevMouseY = e.clientY;
+            render();
+        });
+
+        window.addEventListener('mouseup', () => { isDragging = false; });
+        canvas.addEventListener('wheel', (e) => {
+            cameraZoom -= e.deltaY * 0.001;
+            cameraZoom = Math.max(0.4, Math.min(cameraZoom, 4.0));
+            render();
+            e.preventDefault();
+        }, { passive: false });
+
+        render();
+    </script>
+</body>
+</html>
