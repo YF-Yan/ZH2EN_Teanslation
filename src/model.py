@@ -3,6 +3,14 @@ from torch import nn
 
 from src import config
 
+class Attention(nn.Module):
+    def forward(self,decoder_hidden,encoder_output):
+        attention_scores = torch.bmm(decoder_hidden,encoder_output.transpose(1,2))
+        # attention_scores : [batchsize,1,hiddensize]
+        attention_weights = torch.softmax(attention_scores,dim=-1)
+        return torch.bmm(attention_weights,encoder_output)
+
+
 
 class TranslationEncoder(nn.Module):
     def __init__(self,vocab_size,padding_index):
@@ -24,7 +32,7 @@ class TranslationEncoder(nn.Module):
         lengths = (x != self.embedding.padding_idx).sum(dim=1)
         last_hidden_state = output[torch.arange(output.shape[0]),lengths - 1]
         # last_hidden_state : [batch_size,hidden_size]
-        return last_hidden_state
+        return output,last_hidden_state
 
 class TranslationDecoder(nn.Module):
     def __init__(self,vocab_size,padding_index):
@@ -35,17 +43,30 @@ class TranslationDecoder(nn.Module):
         self.gru = nn.GRU(input_size=config.EMBEDDING_DIM,
                           hidden_size=config.HIDDEN_SIZE,
                           batch_first=True)
-        self.linear = nn.Linear(in_features=config.HIDDEN_SIZE,
+
+        self .attention = Attention()
+
+        self.linear = nn.Linear(in_features=2 * config.HIDDEN_SIZE,
                                 out_features=vocab_size)
 
-    def forward(self,x,hidden_0):
+    def forward(self,x,hidden_0,encoder_output):
         # x:[batch_size,seqlen]
         # hidden : [1,batch_size,hiddensize]
         embed = self.embedding(x)
         # embed : [batch_size,seqlen,embeddingdim]
         output,hidden_n = self.gru(embed,hidden_0)
         # output [batch_size,1,hiddensize]
-        output = self.linear(output)
+
+        # 注意力机制
+        contect_vector = self.attention(output,encoder_output)
+        # contect_vector : [batchsize,1,hiddensize]
+
+        #融合拼接
+        combined = torch.cat([output,contect_vector],dim=-1)
+        # combined : [batchsize ,1,2 * hiddensize]
+
+
+        output = self.linear(combined)
         # output [batch_size,1,vocabsize]
         return output,hidden_n
 
