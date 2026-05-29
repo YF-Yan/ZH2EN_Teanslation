@@ -19,7 +19,7 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
         decoder_inputs = targets[:,:-1]
         decoder_targets = targets[:,1:]
         # 前向
-        context_vector = model.encoder(encoder_inputs)
+        encoder_outputs,context_vector = model.encoder(encoder_inputs)
         # context_vector : [batch_size,hidden_size]
         # 他与解码输入的形状略不同
 
@@ -29,7 +29,7 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
         seq_len = decoder_inputs.shape[1]
         for i in range(seq_len):
             decoder_input = decoder_inputs[:,i].unsqueeze(1) #[batch_size,1]
-            decoder_output,decoder_hidden = model.decoder(decoder_input,decoder_hidden)
+            decoder_output,decoder_hidden = model.decoder(decoder_input,decoder_hidden,encoder_outputs)
             # decoder_output :[batch_size,1,vocab_size]
             decoder_outputs.append(decoder_output)
 
